@@ -1,508 +1,338 @@
+#!/usr/bin/env python3
 """
-ofshore-mcp — MCP Server for ofshore.dev ecosystem
-Gives Claude Desktop / Cursor / any MCP client full access to:
-  - System dashboard & health
-  - Research insights & build queue
-  - Groq inference (free, fast)
-  - Upstash knowledge bus
-  - Telegram messaging
-  - Supabase SQL execution
-  - CF Workers management
+ofshore-ecosystem MCP Server
+Gives Claude direct tools to control and monitor the entire ofshore.dev ecosystem.
+
+Tools:
+- execute_sql         — run SQL on Supabase
+- deploy_app          — trigger Coolify deployment
+- app_status          — get status of all Coolify apps
+- send_telegram       — send message via Guardian bot
+- brain_router_chat   — query brain-router AI
+- cognitive_mind_push — publish knowledge to CognitiveMind
+- cognitive_mind_groq — run Groq query via CM DO
+- n8n_trigger         — trigger n8n webhook
+- upstash_get/set     — read/write Upstash Redis
+- github_file_get     — read file from GitHub
+- github_file_put     — write file to GitHub
+- ecosystem_audit     — full parallel health check
+- worker_call         — call any CF Worker endpoint
 """
 
 import asyncio
 import json
 import os
-import httpx
-from datetime import datetime
 from typing import Any
-from mcp.server.fastmcp import FastMCP
 
-# ── Config ─────────────────────────────────────────────────────────────────────
-SUPABASE_URL  = os.environ["SUPABASE_URL"]
-SUPABASE_KEY  = os.environ["SUPABASE_SERVICE_KEY"]
-GROQ_KEY      = os.environ.get("GROQ_API_KEY", "")
-UPSTASH_URL   = os.environ.get("UPSTASH_URL", "")
-UPSTASH_TOKEN = os.environ.get("UPSTASH_TOKEN", "")
-TG_TOKEN      = os.environ.get("TELEGRAM_TOKEN", "")
-TG_CHAT       = os.environ.get("TELEGRAM_CHAT_ID", "8149345223")
-CF_TOKEN      = os.environ.get("CF_API_TOKEN", "")
-CF_ACCOUNT    = os.environ.get("CF_ACCOUNT_ID", "9a877cdba770217082a2f914427df505")
+import httpx
+from mcp.server import Server
+from mcp.server.stdio import stdio_server
+from mcp.types import (
+    Tool,
+    TextContent,
+    CallToolRequest,
+    CallToolResult,
+    ListToolsRequest,
+    ListToolsResult,
+)
 
-mcp = FastMCP("ofshore-mcp", description="Direct access to ofshore.dev autonomous ecosystem")
+# ── Config ────────────────────────────────────────────────────────────────────
+SUPA_URL   = "https://blgdhfcosqjzrutncbbr.supabase.co"
+SUPA_SVC   = os.getenv("SUPABASE_SERVICE_KEY", "SET_VIA_ENV")
+COOLIFY    = "https://coolify.ofshore.dev"
+COOLIFY_T  = os.getenv("COOLIFY_TOKEN", "SET_VIA_ENV")
+TG_BOT     = os.getenv("TG_BOT", "SET_VIA_ENV")
+TG_CHAT    = os.getenv("TG_CHAT", "SET_VIA_ENV")
+BRAIN      = "https://brain-router.maciej-koziej01.workers.dev"
+BRAIN_KEY  = os.getenv("BRAIN_KEY", "SET_VIA_ENV")
+CM_URL     = "https://cognitive-mind.maciej-koziej01.workers.dev"
+N8N_BRIDGE = "https://n8n-bridge.maciej-koziej01.workers.dev"
+UPSTASH    = "https://fresh-walleye-84119.upstash.io"
+UPSTASH_T  = os.getenv("UPSTASH_TOKEN", "SET_VIA_ENV")
+GITHUB_T   = os.getenv("GITHUB_TOKEN", "SET_VIA_ENV")
 
-# ── HTTP helpers ───────────────────────────────────────────────────────────────
+sh = {"apikey": SUPA_SVC, "Authorization": f"Bearer {SUPA_SVC}", "Content-Type": "application/json"}
+ch = {"Authorization": f"Bearer {COOLIFY_T}"}
+uh = {"Authorization": f"Bearer {UPSTASH_T}"}
+gh = {"Authorization": f"token {GITHUB_T}", "Accept": "application/vnd.github.v3+json"}
 
-async def supa_rpc(func: str, params: dict = {}) -> Any:
-    async with httpx.AsyncClient(timeout=30) as c:
-        r = await c.post(
-            f"{SUPABASE_URL}/rest/v1/rpc/{func}",
-            headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
-                     "Content-Type": "application/json"},
-            json=params,
-        )
-        return r.json()
+server = Server("ofshore-ecosystem")
+client = httpx.AsyncClient(timeout=20.0)
 
-async def supa_query(sql: str) -> Any:
-    return await supa_rpc("execute_sql_with_result", {"sql_query": sql})
+# ── Tools definition ──────────────────────────────────────────────────────────
+TOOLS = [
+    Tool(name="execute_sql", description="Execute SQL on Supabase blgdhfcosqjzrutncbbr. Returns rows as JSON.",
+         inputSchema={"type":"object","properties":{"sql":{"type":"string","description":"SQL query to execute"}},"required":["sql"]}),
 
-async def upstash(*cmd) -> Any:
-    async with httpx.AsyncClient(timeout=5) as c:
-        r = await c.post(UPSTASH_URL,
-            headers={"Authorization": f"Bearer {UPSTASH_TOKEN}", "Content-Type": "application/json"},
-            json=list(cmd))
-        return r.json().get("result")
+    Tool(name="deploy_app", description="Trigger Coolify deployment for an application by UUID or name.",
+         inputSchema={"type":"object","properties":{
+             "uuid":{"type":"string","description":"Coolify app UUID"},
+             "name":{"type":"string","description":"App name (alternative to UUID)"},
+             "force":{"type":"boolean","default":True}},"required":[]}),
 
-async def groq(prompt: str, max_tokens: int = 1000, system: str = "Jesteś agentem Holonu (ofshore.dev). Odpowiadaj precyzyjnie.") -> str:
-    async with httpx.AsyncClient(timeout=20) as c:
-        r = await c.post("https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
-            json={
-                "model": "llama-3.3-70b-versatile",
-                "max_tokens": max_tokens,
-                "temperature": 0.3,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": prompt},
-                ],
-            })
-        return r.json()["choices"][0]["message"]["content"]
+    Tool(name="app_status", description="Get status of all Coolify applications and services.",
+         inputSchema={"type":"object","properties":{},"required":[]}),
 
-# ── TOOLS ──────────────────────────────────────────────────────────────────────
+    Tool(name="send_telegram", description="Send a message via Telegram Guardian bot to Maciej.",
+         inputSchema={"type":"object","properties":{
+             "message":{"type":"string","description":"Message text"},
+             "parse_mode":{"type":"string","default":"","enum":["","Markdown","HTML"]}},"required":["message"]}),
 
-@mcp.tool()
-async def system_dashboard() -> str:
-    """Get complete real-time system dashboard: crons, AI pipeline, integrations, yeshua health."""
-    result = await supa_rpc("system_dashboard")
-    return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+    Tool(name="brain_router_chat", description="Send a prompt to brain-router AI (Groq llama, $0 cost).",
+         inputSchema={"type":"object","properties":{
+             "prompt":{"type":"string"},
+             "path":{"type":"string","default":"reflex","enum":["reflex","think","reason","code"]}},"required":["prompt"]}),
 
+    Tool(name="cognitive_mind_push", description="Publish knowledge to CognitiveMind Durable Object (broadcasts to all WS nodes).",
+         inputSchema={"type":"object","properties":{
+             "topic":{"type":"string"},
+             "event":{"type":"string","default":"learn"},
+             "payload":{"type":"object"}},"required":["topic","payload"]}),
 
-@mcp.tool()
-async def get_research_insights(
-    status: str = "all",
-    limit: int = 20,
-    recommendation: str = "all"
-) -> str:
-    """Get research insights from AI researchers.
+    Tool(name="cognitive_mind_groq", description="Run Groq inference via CognitiveMind edge DO (cached, fast).",
+         inputSchema={"type":"object","properties":{
+             "prompt":{"type":"string"},
+             "max_tokens":{"type":"integer","default":500}},"required":["prompt"]}),
+
+    Tool(name="cognitive_mind_state", description="Get current state for a topic from CognitiveMind KV cache.",
+         inputSchema={"type":"object","properties":{"key":{"type":"string"}},"required":["key"]}),
+
+    Tool(name="n8n_trigger", description="Trigger an n8n webhook via n8n-bridge CF Worker.",
+         inputSchema={"type":"object","properties":{
+             "webhook":{"type":"string","description":"Webhook name",
+                        "enum":["autoheal-alert","agent-factory","automation","agent-task",
+                                "deploy-notification","health-alert","cost-alert","integration-agent",
+                                "wp-security","site-audit","bot-army","scan-competitor"]},
+             "payload":{"type":"object"}},"required":["webhook"]}),
+
+    Tool(name="upstash_get", description="Get value from Upstash Redis.",
+         inputSchema={"type":"object","properties":{"key":{"type":"string"}},"required":["key"]}),
+
+    Tool(name="upstash_set", description="Set value in Upstash Redis with optional TTL.",
+         inputSchema={"type":"object","properties":{
+             "key":{"type":"string"},"value":{"type":"string"},
+             "ttl_seconds":{"type":"integer","default":3600}},"required":["key","value"]}),
+
+    Tool(name="github_file_get", description="Read a file from a GitHub repository.",
+         inputSchema={"type":"object","properties":{
+             "repo":{"type":"string","description":"e.g. szachmacik/brain-router"},
+             "path":{"type":"string","description":"file path in repo"}},"required":["repo","path"]}),
+
+    Tool(name="github_file_put", description="Write/update a file in a GitHub repository.",
+         inputSchema={"type":"object","properties":{
+             "repo":{"type":"string"},"path":{"type":"string"},
+             "content":{"type":"string"},"message":{"type":"string"}},"required":["repo","path","content","message"]}),
+
+    Tool(name="ecosystem_audit", description="Run full parallel health check on all ecosystem components. Returns score and issues.",
+         inputSchema={"type":"object","properties":{},"required":[]}),
+
+    Tool(name="worker_call", description="Call any Cloudflare Worker endpoint.",
+         inputSchema={"type":"object","properties":{
+             "worker":{"type":"string","description":"Worker name, e.g. brain-router"},
+             "path":{"type":"string","default":"/health"},
+             "method":{"type":"string","default":"GET","enum":["GET","POST"]},
+             "body":{"type":"object"}},"required":["worker"]}),
+
+    Tool(name="coolify_restart", description="Restart a Coolify application.",
+         inputSchema={"type":"object","properties":{
+             "uuid":{"type":"string","description":"Coolify app UUID"}},"required":["uuid"]}),
+]
+
+# ── Tool handlers ─────────────────────────────────────────────────────────────
+async def handle_execute_sql(args):
+    r = await client.post(f"{SUPA_URL}/rest/v1/rpc/execute_sql_with_result",
+        headers=sh, json={"query": args["sql"]})
+    if r.status_code == 200:
+        return r.text[:3000]
+    # Fallback to direct query for SELECTs
+    return f"Error {r.status_code}: {r.text[:200]}"
+
+async def handle_deploy_app(args):
+    uuid = args.get("uuid")
+    if not uuid and args.get("name"):
+        r = await client.get(f"{COOLIFY}/api/v1/applications", headers=ch)
+        apps = r.json()
+        for a in apps:
+            if args["name"].lower() in a.get("name","").lower():
+                uuid = a["uuid"]; break
+    if not uuid:
+        return "Error: app not found. Provide uuid or valid name."
+    force = args.get("force", True)
+    r = await client.post(f"{COOLIFY}/api/v1/deploy?uuid={uuid}&force={'true' if force else 'false'}", headers=ch)
+    d = r.json()
+    dep = d.get("deployments",[{}])[0]
+    return json.dumps({"queued": True, "deploy_uuid": dep.get("deployment_uuid","?"), "app": uuid})
+
+async def handle_app_status(args):
+    apps_r = await client.get(f"{COOLIFY}/api/v1/applications", headers=ch)
+    svcs_r = await client.get(f"{COOLIFY}/api/v1/services", headers=ch)
+    apps = apps_r.json() if apps_r.status_code == 200 else []
+    svcs = svcs_r.json() if svcs_r.status_code == 200 else []
     
-    Args:
-        status: Filter by status (new/queued/all)
-        limit: Max results (default 20)
-        recommendation: Filter by monetization check (build_now/validate_first/all)
-    """
-    where_clauses = []
-    if status != "all":
-        where_clauses.append(f"ri.status='{status}'")
-    if recommendation != "all":
-        where_clauses.append(f"mc.recommendation='{recommendation}'")
+    result = {"apps": {}, "services": {}, "summary": {}}
+    healthy = dead = unknown = 0
     
-    where = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
+    for a in apps:
+        s = a.get("status","?")
+        n = a.get("name","?")
+        if "healthy" in s: healthy += 1
+        elif "exited" in s or "unhealthy" in s: dead += 1
+        else: unknown += 1
+        result["apps"][n] = s
     
-    sql = f"""
-    SELECT ri.researcher, ri.solution_name, ri.problem_statement,
-           ri.pain_intensity, ri.estimated_monthly_eur,
-           ri.solution_type, ri.solution_complexity,
-           mc.recommendation, mc.score, ri.status, ri.created_at
-    FROM public.research_insights ri
-    LEFT JOIN public.monetization_checks mc ON mc.insight_id=ri.id
-    {where}
-    ORDER BY COALESCE(mc.score,0) DESC, ri.created_at DESC
-    LIMIT {limit}
-    """
-    result = await supa_query(sql)
-    return json.dumps(result, indent=2, ensure_ascii=False, default=str)
-
-
-@mcp.tool()
-async def get_build_queue(status: str = "queued", limit: int = 30) -> str:
-    """Get items in the autonomous build queue.
+    for s in (svcs if isinstance(svcs, list) else []):
+        result["services"][s.get("name","?")] = s.get("status","?")
     
-    Args:
-        status: queued/in_progress/done/all
-        limit: Max results
-    """
-    where = "" if status == "all" else f"WHERE status='{status}'"
-    sql = f"""
-    SELECT id, build_type, title, description, auto_priority,
-           assigned_being, status, queued_at, started_at
-    FROM public.autonomous_build_queue
-    {where}
-    ORDER BY auto_priority DESC, queued_at ASC
-    LIMIT {limit}
-    """
-    return json.dumps(await supa_query(sql), indent=2, ensure_ascii=False, default=str)
+    result["summary"] = {"healthy": healthy, "dead": dead, "unknown": unknown, "total": len(apps)}
+    return json.dumps(result, indent=2)
 
+async def handle_send_telegram(args):
+    msg = args["message"]
+    parse_mode = args.get("parse_mode","")
+    payload = {"chat_id": TG_CHAT, "text": msg}
+    if parse_mode: payload["parse_mode"] = parse_mode
+    r = await client.post(f"https://api.telegram.org/bot{TG_BOT}/sendMessage", json=payload)
+    d = r.json()
+    return f"Sent: {d.get('ok')} | message_id: {d.get('result',{}).get('message_id','?')}"
 
-@mcp.tool()
-async def queue_build(
-    title: str,
-    description: str,
-    build_type: str = "feature",
-    priority: float = 0.7,
-    agent: str = "Solomon.Arch"
-) -> str:
-    """Add an item to the autonomous build queue.
-    
-    Args:
-        title: What to build
-        description: Detailed description / requirements
-        build_type: feature/tool/integration/infrastructure/saas
-        priority: 0.0-1.0 (1.0 = highest)
-        agent: Which agent handles it
-    """
-    sql = f"""
-    INSERT INTO public.autonomous_build_queue
-      (build_type, title, description, auto_priority, assigned_being)
-    VALUES
-      ('{build_type}', $title$, $desc$, {priority}, '{agent}')
-    RETURNING id, title, queued_at
-    """
-    # Use parameterized via RPC
-    result = await supa_rpc("execute_sql_with_result", {
-        "sql_query": f"""
-        INSERT INTO public.autonomous_build_queue
-          (build_type, title, description, auto_priority, assigned_being)
-        VALUES
-          ('{build_type}', '{title.replace("'","''")}', 
-           '{description.replace("'","''")}',
-           {priority}, '{agent}')
-        RETURNING id::text, title, queued_at::text
-        """
+async def handle_brain_router_chat(args):
+    r = await client.post(f"{BRAIN}/chat",
+        headers={"Content-Type":"application/json","x-app-token":BRAIN_KEY,"x-urgency":"realtime"},
+        json={"prompt": args["prompt"], "force_path": args.get("path","reflex")})
+    d = r.json()
+    return json.dumps({"text": d.get("text",""), "model": d.get("model",""), 
+                       "latency_ms": d.get("latency_ms"), "cost": d.get("cost_usd",0)})
+
+async def handle_cm_push(args):
+    r = await client.post(f"{CM_URL}/push", json={
+        "type":"publish", "topic": args["topic"], "event": args.get("event","learn"),
+        "payload": args["payload"], "source_node": "claude-mcp"
     })
-    return json.dumps(result, indent=2, default=str)
+    return r.text[:200]
 
+async def handle_cm_groq(args):
+    r = await client.post(f"{CM_URL}/groq", json={"prompt": args["prompt"], "max_tokens": args.get("max_tokens",500)})
+    d = r.json()
+    return json.dumps({"text": d.get("text",""), "cached": d.get("cached"), "latency_ms": d.get("latency_ms")})
 
-@mcp.tool()
-async def run_researcher(agent_name: str = "all") -> str:
-    """Trigger AI researcher(s) to find new market opportunities.
-    
-    Args:
-        agent_name: Dr.Signal / Scout.Build / Trends.Watch / Pain.Mapper / all
-    """
-    if agent_name == "all":
-        names = ["Dr.Signal", "Scout.Build", "Trends.Watch", "Pain.Mapper"]
-    else:
-        names = [agent_name]
-    
-    results = {}
-    for name in names:
-        r = await supa_rpc("run_researcher_async", {"p_agent_name": name})
-        results[name] = r
-    
-    return json.dumps({"triggered": names, "req_ids": results,
-                       "note": "Responses collected in ~10s via collect_ai_responses()"}, indent=2)
+async def handle_cm_state(args):
+    r = await client.get(f"{CM_URL}/state/{args['key']}")
+    return r.text[:500]
 
+async def handle_n8n_trigger(args):
+    r = await client.post(f"{N8N_BRIDGE}/trigger/{args['webhook']}",
+        headers={"Content-Type":"application/json"}, json=args.get("payload",{}))
+    return r.text[:300]
 
-@mcp.tool()
-async def collect_insights() -> str:
-    """Collect pending AI responses and save new insights. Run after run_researcher()."""
-    result = await supa_rpc("collect_ai_responses")
-    return json.dumps(result, indent=2, default=str)
+async def handle_upstash_get(args):
+    r = await client.get(f"{UPSTASH}/get/{args['key']}", headers=uh)
+    return r.text[:500]
 
+async def handle_upstash_set(args):
+    ttl = args.get("ttl_seconds", 3600)
+    r = await client.get(f"{UPSTASH}/set/{args['key']}/{args['value']}/EX/{ttl}", headers=uh)
+    return r.text[:100]
 
-@mcp.tool()
-async def groq_ask(prompt: str, max_tokens: int = 1000) -> str:
-    """Run a query through Groq Llama-3.3-70b (FREE, ~150ms).
-    
-    Args:
-        prompt: Your question or task
-        max_tokens: Max response length
-    """
-    return await groq(prompt, max_tokens)
-
-
-@mcp.tool()
-async def kb_write(key: str, value: Any, ttl_seconds: int = 3600) -> str:
-    """Write to Upstash knowledge bus (shared state across all agents).
-    
-    Args:
-        key: Key name (e.g. 'project.status', 'kamila.schedule')
-        value: Any JSON-serializable value
-        ttl_seconds: How long to cache (default 1h)
-    """
-    serialized = json.dumps(value) if not isinstance(value, str) else value
-    result = await upstash("SET", f"kb:{key}", serialized, "EX", str(ttl_seconds))
-    await upstash("LPUSH", "ch:mind_events",
-                  json.dumps({"e": "kb_write", "k": key, "ts": int(datetime.now().timestamp() * 1000)}))
-    return json.dumps({"stored": key, "ttl": ttl_seconds, "result": result})
-
-
-@mcp.tool()
-async def kb_read(key: str) -> str:
-    """Read from Upstash knowledge bus.
-    
-    Args:
-        key: Key name to read
-    """
-    raw = await upstash("GET", f"kb:{key}")
-    if raw is None:
-        return json.dumps({"key": key, "value": None, "exists": False})
-    try:
-        return json.dumps({"key": key, "value": json.loads(raw), "exists": True}, indent=2)
-    except:
-        return json.dumps({"key": key, "value": raw, "exists": True})
-
-
-@mcp.tool()
-async def kb_list(pattern: str = "*") -> str:
-    """List keys in knowledge bus matching a pattern.
-    
-    Args:
-        pattern: Redis pattern (e.g. 'kb:project.*', '*')
-    """
-    keys = await upstash("KEYS", f"kb:{pattern}")
-    return json.dumps({"keys": keys or [], "count": len(keys or [])}, indent=2)
-
-
-@mcp.tool()
-async def send_telegram(message: str, parse_mode: str = "HTML") -> str:
-    """Send a message to Maciej via Telegram Guardian bot.
-    
-    Args:
-        message: Message text (HTML formatting supported)
-        parse_mode: HTML or Markdown
-    """
-    async with httpx.AsyncClient(timeout=10) as c:
-        r = await c.post(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json={"chat_id": TG_CHAT, "text": message, "parse_mode": parse_mode},
-        )
-        d = r.json()
-    return json.dumps({"ok": d.get("ok"), "message_id": d.get("result", {}).get("message_id")})
-
-
-@mcp.tool()
-async def execute_sql(query: str) -> str:
-    """Execute SQL query on Supabase and return results.
-    
-    Args:
-        query: SQL query to execute (SELECT, INSERT, UPDATE, etc.)
-    """
-    result = await supa_query(query)
-    return json.dumps(result, indent=2, ensure_ascii=False, default=str)
-
-
-@mcp.tool()
-async def integration_health() -> str:
-    """Check real-time health of all integrations: Groq, Claude, Upstash, Telegram, brain-router."""
-    # Run fresh check
-    await supa_rpc("check_all_integrations")
-    await asyncio.sleep(8)  # Wait for async checks
-    await supa_rpc("collect_integration_health")
-    
-    sql = "SELECT service, is_healthy, status_code, checked_at FROM public.integration_health_live ORDER BY service"
-    result = await supa_query(sql)
-    return json.dumps(result, indent=2, default=str)
-
-
-@mcp.tool()
-async def cron_status(failing_only: bool = False) -> str:
-    """Get cron job status and recent results.
-    
-    Args:
-        failing_only: Show only failing jobs
-    """
-    having = "HAVING COUNT(*) FILTER (WHERE d.status='failed') > 0" if failing_only else ""
-    sql = f"""
-    SELECT j.jobname, j.schedule,
-      COUNT(*) FILTER (WHERE d.status='succeeded') as ok_24h,
-      COUNT(*) FILTER (WHERE d.status='failed') as fail_24h,
-      (SELECT d2.status FROM cron.job_run_details d2 
-       WHERE d2.jobid=j.jobid ORDER BY d2.start_time DESC LIMIT 1) as last_status,
-      MAX(d.start_time) as last_run
-    FROM cron.job j
-    LEFT JOIN cron.job_run_details d ON d.jobid=j.jobid AND d.start_time>NOW()-INTERVAL '24h'
-    WHERE j.active
-    GROUP BY j.jobname, j.jobid, j.schedule
-    {having}
-    ORDER BY fail_24h DESC, j.jobname
-    LIMIT 50
-    """
-    result = await supa_query(sql)
-    return json.dumps(result, indent=2, default=str)
-
-
-@mcp.tool()
-async def deploy_cf_worker(
-    worker_name: str,
-    worker_code: str,
-    cron: str = ""
-) -> str:
-    """Deploy a Cloudflare Worker to the ofshore.dev account.
-    
-    Args:
-        worker_name: Name for the worker (e.g. 'my-agent')
-        worker_code: Full worker JavaScript/ESM code
-        cron: Optional cron schedule (e.g. '*/5 * * * *')
-    """
+async def handle_github_get(args):
     import base64
-    
-    boundary = "----CFDeploy"
-    metadata: dict = {
-        "main_module": "worker.js",
-        "compatibility_date": "2025-01-01",
-    }
-    if cron:
-        metadata["triggers"] = {"crons": [cron]}
-    
-    body = (
-        f"--{boundary}\r\nContent-Disposition:form-data;name=\"metadata\"\r\nContent-Type:application/json\r\n\r\n"
-        f"{json.dumps(metadata)}\r\n"
-        f"--{boundary}\r\nContent-Disposition:form-data;name=\"worker.js\";filename=\"worker.js\"\r\n"
-        f"Content-Type:application/javascript+module\r\n\r\n"
-        f"{worker_code}\r\n"
-        f"--{boundary}--\r\n"
-    ).encode()
-    
-    async with httpx.AsyncClient(timeout=30) as c:
-        r = await c.put(
-            f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT}/workers/scripts/{worker_name}",
-            headers={
-                "Authorization": f"Bearer {CF_TOKEN}",
-                "Content-Type": f"multipart/form-data; boundary={boundary}",
-            },
-            content=body,
-        )
-        d = r.json()
-    return json.dumps({"success": d.get("success"), "errors": d.get("errors", [])}, indent=2)
+    r = await client.get(f"https://api.github.com/repos/{args['repo']}/contents/{args['path']}", headers=gh)
+    if r.status_code == 200:
+        content = base64.b64decode(r.json()["content"]).decode()
+        return content[:5000]
+    return f"Error {r.status_code}: {r.text[:200]}"
 
+async def handle_github_put(args):
+    import base64
+    # Get SHA
+    r = await client.get(f"https://api.github.com/repos/{args['repo']}/contents/{args['path']}", headers=gh)
+    sha = r.json().get("sha","") if r.status_code == 200 else ""
+    payload = {"message": args["message"], "content": base64.b64encode(args["content"].encode()).decode()}
+    if sha: payload["sha"] = sha
+    r2 = await client.put(f"https://api.github.com/repos/{args['repo']}/contents/{args['path']}",
+        headers=gh, json=payload)
+    d = r2.json()
+    return f"commit: {d.get('commit',{}).get('sha','err')[:12]} | status: {r2.status_code}"
 
-@mcp.tool()
-async def publish_event(event_type: str, payload: dict) -> str:
-    """Publish an event to the CognitiveMind real-time channel (Upstash + pg_notify).
+async def handle_ecosystem_audit(args):
+    workers = [
+        "brain-router","cognitive-mind","agent-router","n8n-bridge",
+        "task-executor","watchdog-v2","coolify-agent","ecosystem-coordinator",
+    ]
+    async def check_w(name):
+        try:
+            r = await client.get(f"https://{name}.maciej-koziej01.workers.dev/health", timeout=6)
+            return name, r.status_code, "ok" if r.status_code==200 else r.text[:40]
+        except Exception as e:
+            return name, 0, str(e)[:40]
     
-    Args:
-        event_type: Event type (e.g. 'task_completed', 'insight_found')
-        payload: Event data
-    """
-    msg = {
-        "e": event_type,
-        "src": "mcp-client",
-        "ts": int(datetime.now().timestamp() * 1000),
-        **payload,
-    }
-    result = await upstash("LPUSH", "ch:mind_events", json.dumps(msg))
-    await upstash("LTRIM", "ch:mind_events", "0", "999")
-    return json.dumps({"published": event_type, "channel_depth": result}, indent=2)
+    tasks = [check_w(w) for w in workers]
+    results = await asyncio.gather(*tasks)
+    ok = sum(1 for _,c,_ in results if c==200)
+    return json.dumps({
+        "score": f"{ok}/{len(workers)}",
+        "workers": {n: {"code":c,"info":i} for n,c,i in results},
+        "integration_hub": (await client.get("https://hub.ofshore.dev/api/health", timeout=5)).status_code,
+    }, indent=2)
 
+async def handle_worker_call(args):
+    worker = args["worker"]
+    path = args.get("path", "/health")
+    method = args.get("method","GET")
+    url = f"https://{worker}.maciej-koziej01.workers.dev{path}"
+    if method == "GET":
+        r = await client.get(url, timeout=10)
+    else:
+        r = await client.post(url, json=args.get("body",{}), timeout=10)
+    return r.text[:2000]
 
-@mcp.tool()
-async def analyze_and_build(topic: str, auto_queue: bool = True) -> str:
-    """Use Groq to analyze a topic, generate insights, and optionally queue for building.
-    
-    Args:
-        topic: What to analyze (e.g. 'payment automation for Polish freelancers')
-        auto_queue: Automatically add top recommendations to build queue
-    """
-    analysis = await groq(
-        f"""Analyze this opportunity for ofshore.dev ecosystem: {topic}
-        
-        ofshore.dev stack: Supabase, Cloudflare Workers, n8n, Coolify, Rust, Groq AI, Upstash Redis.
-        Target: Polish market, B2B/B2C SaaS, quick builds.
-        
-        Return JSON:
-        {{
-          "opportunity": "1-sentence description",
-          "pain_intensity": 0.0-1.0,
-          "market_size": "small/medium/large",
-          "build_days": 1-30,
-          "revenue_potential_eur": 0,
-          "approach": "how to build it",
-          "first_step": "exact first action",
-          "why_now": "timing rationale",
-          "risks": ["risk1", "risk2"]
-        }}""",
-        800,
-        system="You are a senior product analyst. Return ONLY valid JSON."
-    )
+async def handle_coolify_restart(args):
+    r = await client.post(f"{COOLIFY}/api/v1/applications/{args['uuid']}/restart", headers=ch)
+    return f"restart: {r.status_code} {r.text[:100]}"
+
+# ── MCP handlers ──────────────────────────────────────────────────────────────
+@server.list_tools()
+async def list_tools(req: ListToolsRequest) -> ListToolsResult:
+    return ListToolsResult(tools=TOOLS)
+
+@server.call_tool()
+async def call_tool(req: CallToolRequest) -> CallToolResult:
+    name = req.params.name
+    args = req.params.arguments or {}
     
     try:
-        data = json.loads(analysis.replace("```json", "").replace("```", "").strip())
-    except:
-        data = {"raw_analysis": analysis}
+        dispatch = {
+            "execute_sql": handle_execute_sql,
+            "deploy_app": handle_deploy_app,
+            "app_status": handle_app_status,
+            "send_telegram": handle_send_telegram,
+            "brain_router_chat": handle_brain_router_chat,
+            "cognitive_mind_push": handle_cm_push,
+            "cognitive_mind_groq": handle_cm_groq,
+            "cognitive_mind_state": handle_cm_state,
+            "n8n_trigger": handle_n8n_trigger,
+            "upstash_get": handle_upstash_get,
+            "upstash_set": handle_upstash_set,
+            "github_file_get": handle_github_get,
+            "github_file_put": handle_github_put,
+            "ecosystem_audit": handle_ecosystem_audit,
+            "worker_call": handle_worker_call,
+            "coolify_restart": handle_coolify_restart,
+        }
+        
+        handler = dispatch.get(name)
+        if not handler:
+            return CallToolResult(content=[TextContent(type="text", text=f"Unknown tool: {name}")])
+        
+        result = await handler(args)
+        return CallToolResult(content=[TextContent(type="text", text=str(result))])
     
-    if auto_queue and data.get("pain_intensity", 0) > 0.6:
-        await supa_rpc("execute_sql_with_result", {
-            "sql_query": f"""
-            INSERT INTO public.autonomous_build_queue
-              (build_type, title, description, auto_priority, assigned_being)
-            VALUES
-              ('feature', '{topic[:80].replace("'","''")}',
-               '{json.dumps(data)[:300].replace("'","''")}',
-               {data.get('pain_intensity', 0.6)}, 'Solomon.Arch')
-            ON CONFLICT DO NOTHING
-            """
-        })
-        data["queued"] = True
-    
-    return json.dumps(data, indent=2, ensure_ascii=False)
+    except Exception as e:
+        return CallToolResult(content=[TextContent(type="text", text=f"Error: {e}")], isError=True)
 
-
-# ── Resources ──────────────────────────────────────────────────────────────────
-
-@mcp.resource("ofshore://dashboard")
-async def dashboard_resource() -> str:
-    """Live system dashboard as a resource."""
-    result = await supa_rpc("system_dashboard")
-    return json.dumps(result, indent=2, ensure_ascii=False, default=str)
-
-
-@mcp.resource("ofshore://insights/latest")
-async def latest_insights() -> str:
-    """Latest 10 research insights."""
-    sql = """
-    SELECT ri.researcher, ri.solution_name, ri.problem_statement,
-           mc.recommendation, mc.score
-    FROM public.research_insights ri
-    LEFT JOIN public.monetization_checks mc ON mc.insight_id=ri.id
-    ORDER BY ri.created_at DESC LIMIT 10
-    """
-    return json.dumps(await supa_query(sql), indent=2, default=str)
-
-
-@mcp.resource("ofshore://kb/{key}")
-async def kb_resource(key: str) -> str:
-    """Read a key from the knowledge bus."""
-    raw = await upstash("GET", f"kb:{key}")
-    return raw or "{}"
-
-
-# ── Prompts ────────────────────────────────────────────────────────────────────
-
-@mcp.prompt()
-async def morning_briefing() -> str:
-    """Generate a morning briefing from system state."""
-    dash = json.loads(await system_dashboard())
-    return f"""Generate a morning briefing for Maciej based on this system state:
-
-{json.dumps(dash, indent=2, ensure_ascii=False)}
-
-Include:
-1. Overall system health (emoji + 1 sentence)
-2. What was built/happened overnight
-3. Top 3 actions for today
-4. Any warnings or issues
-5. Research insights summary
-
-Keep it concise, in Polish, use emojis."""
-
-
-@mcp.prompt()
-async def build_plan(item: str) -> str:
-    """Generate a detailed build plan for a specific item."""
-    return f"""Create a detailed build plan for: {item}
-
-Context: ofshore.dev ecosystem (Supabase + CF Workers + n8n + Coolify + Rust)
-Maciej is a solo developer. Prefer autonomous solutions.
-
-Include:
-1. Technical approach (what files, what services)
-2. Supabase SQL if needed
-3. CF Worker code if needed  
-4. n8n workflow if needed
-5. Estimated hours
-6. First 3 concrete steps"""
-
+# ── Entry ─────────────────────────────────────────────────────────────────────
+async def main():
+    async with stdio_server() as (r, w):
+        await server.run(r, w, server.create_initialization_options())
 
 if __name__ == "__main__":
-    mcp.run()
+    asyncio.run(main())
